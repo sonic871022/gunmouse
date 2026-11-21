@@ -1,0 +1,10 @@
+# 保护校验清单的 LF 换行（CRLF 会导致 sha256sum -c 把 \r 当文件名的一部分而失败）
+SHA256SUMS.txt text eol=lf
+
+# 二进制固件不做任何换行/文本转换
+*.bin binary
+
+# 文本源码统一用 LF，避免跨平台 diff 噪音
+*.ino text eol=lf
+*.md  text eol=lf
+.gitignore text eol=lf
