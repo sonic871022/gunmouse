@@ -65,6 +65,9 @@ static constexpr uint8_t  CENTER_CFG_VER = 4;
 static constexpr uint32_t MIC_RATE     = 16000;  // 麦克风采样率 Hz
 static constexpr size_t   MIC_BLOCK    = 64;     // 每块样本数 (64/16k = 4ms)
 static constexpr float    GYRO_DZ_DPS = 2.0f;    // 陀螺仪死区 (deg/s)：过滤零偏导致的缓慢漂移
+// ---- 开机稳定（以稳定性为主：充分预热 + 延迟放开鼠标，消除上电温漂）----
+static constexpr uint32_t GYRO_WARMUP_MS = 4000;  // 陀螺仪预热：校准前等待芯片温度趋稳（治本：让测到的零偏接近最终稳定值）
+static constexpr uint32_t BOOT_HOLD_MS   = 8000;  // 开机抑制鼠标输出时长：期间自适应零偏在后台收敛，放开时已基本稳定
 static constexpr uint32_t PRESS_MS    = 45;     // 单发模式左键按下时长
 static constexpr uint32_t REARM_MS    = 400;     // 无模板兜底模式：最长恢复时间
 static constexpr uint32_t HOLD_OFF_MS = 150;     // 连发模式安静多久后松开
@@ -176,7 +179,7 @@ static int32_t  centerX  = CENTER_X;   // 归中 X 位移（可被 2/3 键微调
 static int32_t  centerY  = CENTER_Y;   // 归中 Y 位移（可被 4/5 键微调）
 static bool     centerDirty = false;   // 归中值被微调过，待空闲后补存
 static uint32_t lastCenterEdit = 0;    // 最近一次微调时刻
-static uint32_t bootAt   = 0;   // 开机时刻：前 2.5 秒抑制鼠标输出，消除开机漂移
+static uint32_t bootAt   = 0;   // 开机时刻：前 BOOT_HOLD_MS 抑制鼠标输出，消除开机漂移
 // ---- 自动学习轴（L 键）----
 static float    learnRange[3] = {0, 0, 0};  // 学习阶段各轴角速度的 max-min 跨度
 static bool     learnActive = false;        // 学习流程进行中（抑制摇杆/枪声干扰显示）
@@ -822,18 +825,31 @@ static void updateAim(uint32_t t0) {
     auto d = M5.Imu.getImuData();
 
     // ---- 运行时自适应零偏：消除温漂导致的缓慢漂移 ----
-    // 三轴角速度都很小 = 设备基本静止，此时把零偏朝当前读数极慢收敛。
-    // 只有持续静止 > 1.5 秒才开始，且每帧只修正 0.3%，不会吃掉正常转动。
+    // ★ 判据必须用「原始角速度」：设备静止时读数本身就是零偏，读数小 = 静止。
+    //   曾误改成「减零偏后的残差」，结果冷机温漂/校准偏差让残差超过阈值时，
+    //   收敛判据永不满足、零偏被锁死，恒定偏差持续输出成位移
+    //   （实测表现为鼠标开机后一直往右下角飘且再也不停）—— 已回退。
     float ax = fabsf(d.gyro.x), ay = fabsf(d.gyro.y), az = fabsf(d.gyro.z);
     if (ax < 4.0f && ay < 4.0f && az < 4.0f) {
       stillMs += (uint32_t)(dt * 1000000.0f);
-      if (stillMs > 1500) {
-        gyroZero[0] += (d.gyro.x - gyroZero[0]) * 0.003f;
-        gyroZero[1] += (d.gyro.y - gyroZero[1]) * 0.003f;
-        gyroZero[2] += (d.gyro.z - gyroZero[2]) * 0.003f;
-      }
     } else {
       stillMs = 0;
+    }
+
+    if (millis() - bootAt < BOOT_HOLD_MS) {
+      // 开机抑制期：设备按要求静止放置，额外做一次「强制收敛」。
+      // 阈值放宽到 15dps、每帧 2%，确保冷机温漂较大时也能在放开鼠标前把零偏追到位；
+      // 只在抑制期内生效，之后恢复原版慢收敛，不影响正常操作手感。
+      if (ax < 15.0f && ay < 15.0f && az < 15.0f) {
+        gyroZero[0] += (d.gyro.x - gyroZero[0]) * 0.02f;
+        gyroZero[1] += (d.gyro.y - gyroZero[1]) * 0.02f;
+        gyroZero[2] += (d.gyro.z - gyroZero[2]) * 0.02f;
+      }
+    } else if (stillMs > 1500) {
+      // 原版慢收敛：持续静止才极慢修正，不会吃掉正常转动
+      gyroZero[0] += (d.gyro.x - gyroZero[0]) * 0.003f;
+      gyroZero[1] += (d.gyro.y - gyroZero[1]) * 0.003f;
+      gyroZero[2] += (d.gyro.z - gyroZero[2]) * 0.003f;
     }
 
     float rawYaw = d.gyro.value[yawAx] - gyroZero[yawAx];
@@ -858,8 +874,9 @@ static void updateAim(uint32_t t0) {
   if (dx >  127) { dx =  127; dxAcc =  0.5f; }
   if (dy < -127) { dy = -127; dyAcc = -0.5f; }
   if (dy >  127) { dy =  127; dyAcc =  0.5f; }
-  // 开机后 2.5 秒内抑制鼠标输出：此时自适应零偏仍在收敛，避免前几秒漂移
-  if (millis() - bootAt < 2500) return;
+  // 开机后抑制鼠标输出：期间自适应零偏仍在后台收敛，避免前几十秒漂移。
+  // 时长取 BOOT_HOLD_MS（以稳定性为主），放大后手感才完全正常。
+  if (millis() - bootAt < BOOT_HOLD_MS) return;
   if (dx != 0 || dy != 0) Mouse.move((int8_t)dx, (int8_t)dy);
 
   // 屏幕上的装饰准星随手势移动
@@ -1314,9 +1331,12 @@ void setup() {
 
   // 麦克风上电后约 1 秒预热期数据全零 —— 校准前先等一下
   delay(1100);
+  // ★ 陀螺仪预热：BMI270 上电后零偏随温度缓慢变化（温漂），约数十秒才稳定。
+  //   等芯片升温趋稳后再采样零偏，测到的值更接近最终稳定值 —— 这是消除开机漂移的治本一步。
+  delay(GYRO_WARMUP_MS);
 
   runCalibration(false);
-  bootAt = millis();   // 记录开机完成时刻，前 2.5 秒抑制鼠标输出消除漂移
+  bootAt = millis();   // 记录开机完成时刻，前 BOOT_HOLD_MS 抑制鼠标输出消除漂移
 }
 
 /* ============================= loop ============================= */
